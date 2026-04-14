@@ -14,7 +14,7 @@ import {
   ProxySelectionError,
 } from "../../error";
 import { MockState } from "../../lib/mock";
-import { fireEngineStagingURL, fireEngineURL } from "./scrape";
+import { fireEngineURL } from "./scrape";
 import { getDocFromGCS } from "../../../../lib/gcs-jobs";
 import { Meta } from "../..";
 
@@ -36,10 +36,6 @@ const successSchema = z.object({
   // timeTakenCookie: z.number().optional(),
   // timeTakenRequest: z.number().optional(),
 
-  // legacy: playwright only
-  screenshot: z.string().optional(),
-
-  // new: actions
   screenshots: z.string().array().optional(),
   actionContent: z
     .object({
@@ -140,10 +136,10 @@ export async function fireEngineCheckStatus(
   jobId: string,
   mock: MockState | null,
   abort?: AbortSignal,
-  production = true,
+  baseUrl: string = fireEngineURL,
 ): Promise<FireEngineCheckStatusSuccess> {
   let status = await robustFetch({
-    url: `${production ? fireEngineURL : fireEngineStagingURL}/scrape/${jobId}`,
+    url: `${baseUrl}/scrape/${jobId}`,
     method: "GET",
     logger: logger.child({ method: "fireEngineCheckStatus/robustFetch" }),
     headers: {},

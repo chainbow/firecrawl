@@ -26,9 +26,15 @@ import {
   lockURLsIndividually,
   normalizeURL,
   saveCrawl,
+  setCrawlError,
   StoredCrawl,
 } from "../../lib/crawl-redis";
 import { redisEvictConnection } from "../redis";
+import {
+  resolveBillingMetadata,
+  toAutumnBillingProperties,
+} from "../billing/types";
+import { autumnService } from "../autumn/autumn.service";
 import {
   _addScrapeJobToBullMQ,
   addScrapeJob,
@@ -45,7 +51,7 @@ import { startWebScraperPipeline } from "../../main/runWebScraper";
 import { CostTracking } from "../../lib/cost-tracking";
 import { normalizeUrlOnlyHostname } from "../../lib/canonical-url";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
-import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { generateURLSplits, queryIndexAtSplitLevel } from "../index";
 import { WebCrawler } from "../../scraper/WebScraper/crawler";
 import { calculateCreditsToBeBilled } from "../../lib/scrape-billing";
@@ -60,6 +66,7 @@ import {
   UnknownError,
 } from "../../lib/error";
 import { serializeTransportableError } from "../../lib/error-serde";
+import { trackScrape } from "../../lib/tracking";
 import type { NuQJob } from "./nuq";
 import {
   ScrapeJobData,
@@ -97,6 +104,17 @@ async function billScrapeJob(
   unsupportedFeatures?: Set<FeatureFlag>,
 ) {
   let creditsToBeBilled: number | null = null;
+  const billing = resolveBillingMetadata({
+    billing: job.data.billing,
+    crawlId: job.data.crawl_id,
+    crawlerOptions: job.data.crawlerOptions,
+  });
+  const autumnProperties = {
+    source: "billScrapeJob",
+    ...toAutumnBillingProperties(billing),
+    apiKeyId: job.data.apiKeyId,
+  };
+  let trackedInRequest = false;
 
   if (job.data.is_scrape !== true && !job.data.internalOptions?.bypassBilling) {
     creditsToBeBilled = await calculateCreditsToBeBilled(
@@ -114,11 +132,18 @@ async function billScrapeJob(
       config.USE_DB_AUTHENTICATION
     ) {
       try {
+        trackedInRequest = await autumnService.trackCredits({
+          teamId: job.data.team_id,
+          value: creditsToBeBilled,
+          properties: autumnProperties,
+          requestScoped: true,
+        });
         const billingJobId = uuidv7();
         logger.debug(
           `Adding billing job to queue for team ${job.data.team_id}`,
           {
             billingJobId,
+            billing,
             credits: creditsToBeBilled,
             is_extract: false,
           },
@@ -131,22 +156,32 @@ async function billScrapeJob(
             team_id: job.data.team_id,
             subscription_id: undefined,
             credits: creditsToBeBilled,
+            billing,
             is_extract: false,
             timestamp: new Date().toISOString(),
             originating_job_id: job.id,
             api_key_id: job.data.apiKeyId,
+            autumnTrackInRequest: trackedInRequest,
           },
           {
             jobId: billingJobId,
             priority: 10,
           },
         );
+
         return creditsToBeBilled;
       } catch (error) {
         logger.error(
           `Failed to add billing job to queue for team ${job.data.team_id} for ${creditsToBeBilled} credits`,
           { error },
         );
+        if (trackedInRequest && creditsToBeBilled !== null) {
+          await autumnService.refundCredits({
+            teamId: job.data.team_id,
+            value: creditsToBeBilled,
+            properties: autumnProperties,
+          });
+        }
         captureExceptionWithZdrCheck(error, {
           extra: { zeroDataRetention: job.data.zeroDataRetention ?? false },
         });
@@ -181,10 +216,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
   const abortTimeoutHandle =
     remainingTime !== undefined
       ? setTimeout(
-          () =>
-            abortController.abort(
-              new ScrapeJobTimeoutError(),
-            ),
+          () => abortController.abort(new ScrapeJobTimeoutError()),
           remainingTime,
         )
       : undefined;
@@ -322,7 +354,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
             (await getACUCTeam(job.data.team_id))?.flags ?? null,
           )
         ) {
-          throw new CrawlDenialError(BLOCKLISTED_URL_MESSAGE); // TODO: make this its own error type that is ignored by error tracking
+          throw new CrawlDenialError(UNSUPPORTED_SITE_MESSAGE); // TODO: make this its own error type that is ignored by error tracking
         }
 
         const p1 = generateURLPermutations(normalizeURL(doc.metadata.url, sc));
@@ -410,6 +442,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
                     integration: job.data.integration,
                     crawl_id: job.data.crawl_id,
                     requestId: job.data.requestId,
+                    billing: job.data.billing,
                     webhook: job.data.webhook,
                     v1: job.data.v1,
                     zeroDataRetention: job.data.zeroDataRetention,
@@ -490,6 +523,19 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         true,
       );
 
+      trackScrape({
+        scrapeId: job.id,
+        requestId: job.data.requestId ?? job.data.crawl_id ?? job.id,
+        teamId: job.data.team_id,
+        url: job.data.url,
+        origin: job.data.origin,
+        kind: job.data.billing?.endpoint ?? "unknown",
+        isSuccessful: true,
+        creditsCost: credits_billed ?? 0,
+        timeTaken: timeTakenInSeconds,
+        zeroDataRetention: job.data.zeroDataRetention,
+      }).catch(err => logger.warn("Scrape tracking failed", { error: err }));
+
       if (job.data.v1) {
         const sender = await createWebhookSender({
           teamId: job.data.team_id,
@@ -541,7 +587,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
 
       doc.metadata.creditsUsed = credits_billed ?? undefined;
 
-      await logScrape(
+      const logScrapePromise = logScrape(
         {
           id: job.id,
           request_id: job.data.requestId ?? job.data.crawl_id ?? job.id,
@@ -559,6 +605,29 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         },
         false,
       );
+
+      trackScrape({
+        scrapeId: job.id,
+        requestId: job.data.requestId ?? job.data.crawl_id ?? job.id,
+        teamId: job.data.team_id,
+        url: job.data.url,
+        origin: job.data.origin,
+        kind: job.data.billing?.endpoint ?? "unknown",
+        isSuccessful: true,
+        creditsCost: credits_billed ?? 0,
+        timeTaken: timeTakenInSeconds,
+        zeroDataRetention: job.data.zeroDataRetention,
+      }).catch(err => logger.warn("Scrape tracking failed", { error: err }));
+
+      if (job.data.skipNuq) {
+        // doesn't use GCS for result retrieval, safe to not await
+        logScrapePromise.catch(err =>
+          logger.warn("Background scrape log failed", { error: err }),
+        );
+      } else {
+        // v0 - must await because waitForJob reads from GCS
+        await logScrapePromise;
+      }
     }
 
     logger.info(`🐂 Job done ${job.id}`);
@@ -711,6 +780,20 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       },
       true,
     );
+
+    trackScrape({
+      scrapeId: job.id,
+      requestId: job.data.requestId ?? job.data.crawl_id ?? job.id,
+      teamId: job.data.team_id,
+      url: job.data.url,
+      origin: job.data.origin,
+      kind: job.data.billing?.endpoint ?? "unknown",
+      isSuccessful: false,
+      creditsCost: credits_billed ?? 0,
+      timeTaken: timeTakenInSeconds,
+      zeroDataRetention: job.data.zeroDataRetention,
+    }).catch(err => logger.warn("Scrape tracking failed", { error: err }));
+
     return data;
   } finally {
     if (abortTimeoutHandle) clearTimeout(abortTimeoutHandle);
@@ -789,6 +872,7 @@ async function addKickoffSitemapJob(
       integration: sourceJob.data.integration,
       crawl_id: sourceJob.data.crawl_id,
       requestId: sourceJob.data.requestId,
+      billing: sourceJob.data.billing,
       webhook: sourceJob.data.webhook,
       v1: sourceJob.data.v1,
       apiKeyId: sourceJob.data.apiKeyId,
@@ -841,6 +925,7 @@ async function processKickoffJob(job: NuQJob<ScrapeJobKickoff>) {
         integration: job.data.integration,
         crawl_id: job.data.crawl_id,
         requestId: job.data.requestId,
+        billing: job.data.billing,
         webhook: job.data.webhook,
         v1: job.data.v1,
         isCrawlSourceScrape: true,
@@ -928,6 +1013,7 @@ async function processKickoffJob(job: NuQJob<ScrapeJobKickoff>) {
             integration: job.data.integration,
             crawl_id: job.data.crawl_id,
             requestId: job.data.requestId,
+            billing: job.data.billing,
             sitemapped: true,
             webhook: job.data.webhook,
             v1: job.data.v1,
@@ -965,7 +1051,12 @@ async function processKickoffJob(job: NuQJob<ScrapeJobKickoff>) {
   } catch (error) {
     logger.error("An error occurred!", { error });
     await finishCrawlKickoff(job.data.crawl_id);
-    const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
+    await setCrawlError(
+      job.data.crawl_id,
+      error instanceof Error
+        ? error.message
+        : "An unexpected error occurred during crawl setup",
+    );
     return { success: false, error };
   }
 }
@@ -1035,6 +1126,7 @@ async function processKickoffSitemapJob(job: NuQJob<ScrapeJobKickoffSitemap>) {
           integration: job.data.integration,
           crawl_id: job.data.crawl_id,
           requestId: job.data.requestId,
+          billing: job.data.billing,
           sitemapped: true,
           webhook: job.data.webhook,
           v1: job.data.v1,

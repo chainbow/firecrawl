@@ -8,10 +8,13 @@ export type ErrorCodes =
   | "SCRAPE_PROXY_SELECTION_ERROR"
   | "SCRAPE_PDF_PREFETCH_FAILED"
   | "SCRAPE_DOCUMENT_PREFETCH_FAILED"
+  | "SCRAPE_JOB_CANCELLED"
+  | "SCRAPE_RETRY_LIMIT"
   | "SCRAPE_ZDR_VIOLATION_ERROR"
   | "SCRAPE_DNS_RESOLUTION_ERROR"
   | "SCRAPE_PDF_INSUFFICIENT_TIME_ERROR"
   | "SCRAPE_PDF_ANTIBOT_ERROR"
+  | "SCRAPE_PDF_OCR_REQUIRED"
   | "SCRAPE_DOCUMENT_ANTIBOT_ERROR"
   | "SCRAPE_UNSUPPORTED_FILE_ERROR"
   | "SCRAPE_ACTION_ERROR"
@@ -19,7 +22,11 @@ export type ErrorCodes =
   | "SCRAPE_NO_CACHED_DATA"
   | "SCRAPE_SITEMAP_ERROR"
   | "SCRAPE_ACTIONS_NOT_SUPPORTED"
+  | "SCRAPE_BRANDING_NOT_SUPPORTED"
+  | "AGENT_INDEX_ONLY"
+  | "SCRAPE_AUDIO_UNSUPPORTED_URL"
   | "CRAWL_DENIAL"
+  | "MAP_FAILED"
   | "BAD_REQUEST_INVALID_JSON"
   | "BAD_REQUEST";
 
@@ -116,6 +123,25 @@ export class MapTimeoutError extends TransportableError {
     data: ReturnType<typeof this.prototype.serialize>,
   ) {
     const x = new MapTimeoutError();
+    x.stack = data.stack;
+    return x;
+  }
+}
+
+export class MapFailedError extends TransportableError {
+  constructor(message: string) {
+    super("MAP_FAILED", message);
+  }
+
+  serialize() {
+    return super.serialize();
+  }
+
+  static deserialize(
+    _code: ErrorCodes,
+    data: ReturnType<typeof this.prototype.serialize>,
+  ) {
+    const x = new MapFailedError(data.message);
     x.stack = data.stack;
     return x;
   }

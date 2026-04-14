@@ -71,7 +71,7 @@ export const URL = z.preprocess(
         return false;
       }
     }, "Invalid URL"),
-  // .refine((x) => !isUrlBlocked(x as string), BLOCKLISTED_URL_MESSAGE),
+  // .refine((x) => !isUrlBlocked(x as string), UNSUPPORTED_SITE_MESSAGE),
 );
 
 const strictMessage =
@@ -400,6 +400,13 @@ const attributesFormatWithOptions = z.strictObject({
 
 type AttributesFormatWithOptions = z.output<typeof attributesFormatWithOptions>;
 
+const queryFormatWithOptions = z.strictObject({
+  type: z.literal("query"),
+  prompt: z.string().max(10000),
+});
+
+type QueryFormatWithOptions = z.output<typeof queryFormatWithOptions>;
+
 export type FormatObject =
   | { type: "markdown" }
   | { type: "html" }
@@ -411,10 +418,17 @@ export type FormatObject =
   | ChangeTrackingFormatWithOptions
   | ScreenshotFormatWithOptions
   | AttributesFormatWithOptions
-  | { type: "branding" };
+  | QueryFormatWithOptions
+  | { type: "branding" }
+  | { type: "audio" };
+
+const pdfModeSchema = z.enum(["fast", "auto", "ocr"]);
+
+export type PDFMode = z.infer<typeof pdfModeSchema>;
 
 const pdfParserWithOptions = z.strictObject({
   type: z.literal("pdf"),
+  mode: pdfModeSchema.optional(),
   maxPages: z.int().positive().finite().max(10000).optional(),
 });
 
@@ -447,6 +461,17 @@ export function getPDFMaxPages(parsers?: Parsers): number | undefined {
     return (pdfParser as any).maxPages;
   }
   return undefined;
+}
+
+export function getPDFMode(parsers?: Parsers): PDFMode {
+  if (!parsers) return "auto";
+  for (const parser of parsers) {
+    if (parser === "pdf") return "auto";
+    if (typeof parser === "object" && parser.type === "pdf") {
+      return parser.mode ?? "auto";
+    }
+  }
+  return "auto";
 }
 
 function transformIframeSelector(selector: string): string {
@@ -503,6 +528,8 @@ const baseScrapeOptions = z.strictObject({
           screenshotFormatWithOptions,
           attributesFormatWithOptions,
           z.strictObject({ type: z.literal("branding") }),
+          queryFormatWithOptions,
+          z.strictObject({ type: z.literal("audio") }),
         ])
         .array()
         .optional()
@@ -528,6 +555,7 @@ const baseScrapeOptions = z.strictObject({
     .transform(tags => tags.map(transformIframeSelector))
     .optional(),
   onlyMainContent: z.boolean().prefault(true),
+  onlyCleanContent: z.boolean().prefault(false),
   timeout: z.int().positive().min(1000).optional(),
   waitFor: z.int().nonnegative().max(60000).prefault(0),
   mobile: z.boolean().prefault(false),
@@ -545,11 +573,20 @@ const baseScrapeOptions = z.strictObject({
   maxAge: z.int().gte(0).optional(),
   minAge: z.int().gte(0).optional(),
   storeInCache: z.boolean().prefault(true),
+
+  profile: z
+    .object({
+      name: z.string().min(1).max(128),
+      saveChanges: z.boolean().default(true),
+    })
+    .optional(),
+
   // @deprecated
   __searchPreviewToken: z.string().optional(),
   __experimental_omce: z.boolean().prefault(false).optional(),
   __experimental_omceDomain: z.string().optional(),
   __experimental_engpicker: z.boolean().prefault(false).optional(),
+  __forceFirePDF: z.boolean().prefault(false).optional(),
 });
 
 type ScrapeOptionsBase = z.infer<typeof baseScrapeOptions>;
@@ -771,7 +808,7 @@ const scrapeRequestSchemaBase = baseScrapeOptions.extend({
       auth: z.string(),
       requestId: z.string(),
       shouldBill: z.boolean(),
-      boostConcurrency: z.boolean().optional()
+      boostConcurrency: z.boolean().optional(),
     })
     .optional(),
 });
@@ -971,9 +1008,11 @@ export type Document = {
   links?: string[];
   images?: string[];
   screenshot?: string;
+  audio?: string;
   extract?: any;
   json?: any;
   summary?: string;
+  answer?: string;
   branding?: BrandingProfile;
   warning?: string;
   attributes?: {
@@ -1077,6 +1116,8 @@ export type ErrorResponse = {
   code?: ErrorCodes;
   error: string;
   details?: any;
+  sponsor_status?: string;
+  login_url?: string;
 };
 
 export type ScrapeResponse =
@@ -1209,6 +1250,16 @@ export type CrawlStatusResponse =
       next?: string;
       data: Document[];
       warning?: string;
+    }
+  | {
+      success: false;
+      status: "failed";
+      error: string;
+      completed: number;
+      total: number;
+      creditsUsed: number;
+      expiresAt: string;
+      data: Document[];
     };
 
 export type OngoingCrawlsResponse =
@@ -1239,6 +1290,7 @@ export type CrawlErrorsResponse =
 
 type AuthObject = {
   team_id: string;
+  org_id?: string | null;
 };
 
 type Account = {
@@ -1250,13 +1302,15 @@ export type TeamFlags = {
   unblockedDomains?: string[];
   forceZDR?: boolean;
   allowZDR?: boolean;
+  scrapeZDR?: "disabled" | "allowed" | "forced";
+  searchZDR?: "disabled" | "allowed" | "forced";
   zdrCost?: number;
   checkRobotsOnScrape?: boolean;
-  allowTeammateInvites?: boolean;
   crawlTtlHours?: number;
   ipWhitelist?: boolean;
   bypassCreditChecks?: boolean;
   debugBranding?: boolean;
+  maxBrowserSessions?: number;
 } | null;
 
 interface RequestWithMaybeACUC<
@@ -1644,6 +1698,7 @@ export const searchRequestSchema = z
                 z.strictObject({ type: z.literal("images") }),
                 z.strictObject({ type: z.literal("summary") }),
                 jsonFormatWithOptions,
+                queryFormatWithOptions,
                 screenshotFormatWithOptions,
               ])
               .array()
